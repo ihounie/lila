@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import pickle
 from copy import deepcopy
+import os
 from absl import app, flags, logging
 from pathlib import Path
 from torchvision import transforms
@@ -14,17 +15,20 @@ from lila.datasets import RotatedMNIST, TranslatedMNIST, ScaledMNIST
 from lila.datasets import RotatedFashionMNIST, TranslatedFashionMNIST, ScaledFashionMNIST
 from lila.datasets import RotatedCIFAR10, TranslatedCIFAR10, ScaledCIFAR10
 from lila.utils import TensorDataLoader, dataset_to_tensors, get_laplace_approximation, set_seed
-from lila.layers import AffineLayer2d
+from lila.layers import AffineLayer2d, Constrained_Affine
 from lila.augerino import augerino
+from lila.constrained import primal_dual
+from lila.uniform import uniform_aug
 from lila.models import MLP, LeNet, ResNet, WideResNet
 
+import wandb
 
 FLAGS = flags.FLAGS
 np.set_printoptions(precision=3)
 
 flags.DEFINE_integer('seed', 137, 'Random seed for data generation and model initialization.')
 flags.DEFINE_enum(
-    'method', 'avgfunc', ['avgfunc', 'augerino'],
+    'method', 'avgfunc', ['avgfunc', 'augerino', 'constrained', 'uniform_aug'],
     'Available methods: `avgfunc` is averaging functions, `augerino` is by Benton et al.')
 flags.DEFINE_float('augerino_reg', 1e-2, 'Augerino regularization strength (default from paper).')
 flags.DEFINE_enum(
@@ -51,7 +55,7 @@ flags.DEFINE_bool('softplus', False, 'Whether to use softplus on the rot factor 
 flags.DEFINE_float('init_aug', 0.0, 'Initial value for the transformation parameters (before softplus if its used)')
 flags.DEFINE_bool('save', True, 'Whether to save the experiment outcome as pickle')
 flags.DEFINE_enum('device', 'cuda', ['cpu', 'cuda'], 'Torch device')
-flags.DEFINE_bool('download', False, 'whether to (re-)download data set')
+flags.DEFINE_bool('download', True, 'whether to (re-)download data set')
 flags.DEFINE_string('data_root', 'tmp', 'root of the data directory')
 
 flags.DEFINE_float('lr', 0.005, 'lr')
@@ -68,7 +72,17 @@ flags.DEFINE_integer(
     'number of steps on every marginal likelihood estimate (repeated fit, partial fit (default))'
 )
 flags.DEFINE_integer('n_hypersteps_prior', 1, 'hyper steps for prior')
-
+##############
+# Constrained
+##############
+flags.DEFINE_float('lr_dual', 1e-2, 'dual learning rate')
+flags.DEFINE_float('epsilon', 0.1, 'constraint_level')
+flags.DEFINE_bool('keep_all', False, 'whether to keep all samples in the chain')
+##############
+#   LOGGING
+##############
+flags.DEFINE_bool('wandb_log', True, 'W&B logging')
+flags.DEFINE_string('project', 'Invariance', 'W&B project')
 
 def main(argv):
     # dataset-specific static transforms (preprocessing)
@@ -140,10 +154,12 @@ def main(argv):
         subset_indices = None
     X_train, y_train = dataset_to_tensors(train_dataset, subset_indices, FLAGS.device)
     X_test, y_test = dataset_to_tensors(test_dataset, None, FLAGS.device)
-
-    augmenter = AffineLayer2d(n_samples=FLAGS.n_samples_aug, init_value=FLAGS.init_aug,
+    if FLAGS.method in ["constrained", "uniform_aug"]:
+        augmenter = Constrained_Affine(FLAGS.dataset, n_samples=FLAGS.n_samples_aug).to(FLAGS.device)
+    else:
+        augmenter = AffineLayer2d(n_samples=FLAGS.n_samples_aug, init_value=FLAGS.init_aug,
                               softplus=FLAGS.softplus).to(FLAGS.device)
-    augmenter.rot_factor.requires_grad = FLAGS.optimize_aug
+        augmenter.rot_factor.requires_grad = FLAGS.optimize_aug
 
     if FLAGS.batch_size <= 0:  # full batch
         batch_size = subset_size
@@ -195,7 +211,7 @@ def main(argv):
     model.to(FLAGS.device)
 
     result = dict()
-    if FLAGS.method != 'augerino':  # LA marglik methods
+    if FLAGS.method not in ['augerino', 'constrained', 'uniform_aug']:  # LA marglik methods
         # Resolve backend and LA type
         hess_approx, la_structure = FLAGS.approx.split('_')
         laplace = get_laplace_approximation(la_structure)
@@ -241,8 +257,40 @@ def main(argv):
         logging.info(f'aug params: {aug_params}.')
         result['losses'] = losses
 
+    elif FLAGS.method == 'constrained':
+        train_loader.attach()
+        model, losses, valid_perfs, train_perfs, dual = primal_dual(
+            model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
+            augmenter=augmenter, epsilon=FLAGS.epsilon, lr_dual=FLAGS.lr_dual,
+            lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
+        )
+        result['losses'] = losses
+    elif FLAGS.method == 'uniform_aug':
+        train_loader.attach()
+        model, losses, valid_perfs, train_perfs = uniform_aug(
+            model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
+            augmenter=augmenter, lr_min=FLAGS.lr_min,
+            scheduler='cos', optimizer=optimizer
+        )
+        result['losses'] = losses
+
     else:
         raise ValueError(f'Invalid method {FLAGS.method}')
+
+    if FLAGS.wandb_log:
+        name = f'{FLAGS.dataset}_{FLAGS.method}_N={FLAGS.subset_size}_seed={FLAGS.seed}'
+        wandb.init(project=FLAGS.project, entity="hounie", name=name)
+        config = {"dataset": FLAGS.dataset, "model":FLAGS.model,
+                 "num_samples": FLAGS.subset_size,"seed":FLAGS.seed,
+                 "method": FLAGS.method,"lr_dual":FLAGS.lr_dual, "epsilon":FLAGS.epsilon,
+                 "MH_keep":FLAGS.keep_all, "epochs":FLAGS.n_epochs, "n_samples_aug":FLAGS.n_samples_aug} 
+        wandb.config.update(config)
+        wandb.log({"test_acc":valid_perfs[-1] , "train_acc": train_perfs[-1], "train_loss": losses[-1]})
+        if FLAGS.method == 'constrained':
+            wandb.log({"dual":dual})
+        weights_path = os.path.join('weights', str(wandb.run.id)+'.pt')
+        torch.save(model.state_dict(), weights_path)
+        wandb.save(weights_path, policy = 'now')
 
     if FLAGS.save:
         result_path = Path(f'results/{FLAGS.dataset}/{FLAGS.model}/')

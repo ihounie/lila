@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from math import pi
+from math import pi, cos, log
 
 
 class AffineLayer2d(torch.nn.Module):
@@ -189,3 +189,85 @@ class RotationLayer(torch.nn.Module):
         
             # Apply to input
             return torch.einsum('cji,bi->bcj', matrices, x)
+
+class Constrained_Affine(torch.nn.Module):
+    """ Layer that creates affine transformed versions of 2d image inputs sampled between U(-parameter, +parameter),
+        with single scalar parameter.
+
+        Args:
+            rot_factor: Initial rotation factor (0 = no invariance, 1 = full circle ±180 degrees)
+            deterministic: If true, we replace the stochastic reparameterization trick by scaling fixed linspaced samples
+            n_samples: Amount of samples to use.
+            independent: Independently sample datapoints within batch (otherwise the n_samples samples are joinedly sampled within the batch for speed-up)
+
+     """
+    def __init__(self, dataset, n_samples=16):
+        super().__init__()
+
+        self.n_samples = n_samples
+        if "_r" in dataset:
+            self.mode="rotation"
+            init_value = pi*int(dataset.split("_r")[-1])/180.0
+            print("Restricting rotations to ", int(dataset.split("_r")[-1])/180)
+        elif "translated" in dataset:
+            self.mode = "translation"
+            if "cifar" in dataset:
+                init_value = 8/16
+            elif "mnist" in dataset:
+                init_value = 8/14
+            else:
+                raise NotImplementedError
+            print(f"Restricting translations to {init_value}")
+        elif "scaled" in dataset:
+            self.mode = "scaled"
+            init_value = log(2)
+        self.init_value = init_value
+
+    def forward(self, x, align_corners=False, mode='bilinear'):
+        """Connects to the next available port.
+
+        Args:
+            x: Input tensor with dimensions (B, C, H, W)
+            align_corners: Uses align_corners convention.
+            mode: Type of interpolation. (nearest|bilinear)
+
+        Returns:
+            Rotated input 'n_samples' times with rotations uniformly sampled between -rot_factor*pi and +rot_factor*pi rads.
+            Output dimension: (B, n_samples, C, H, W)
+
+        """
+
+        # Obtain sample values
+        device = x.device
+
+        # Build resampling grids
+        N, C, H, W = x.shape
+        # Evaluate corresponding vector field on pixel locations
+        out_shape = (N * (self.n_samples+1), C, H, W)
+
+        if self.mode=="rotation":
+            thetas = torch.cat((torch.zeros(N, device=device), torch.rand(N*self.n_samples, device=device) * 2 - 1)) * self.init_value
+            c, s = torch.cos(thetas), torch.sin(thetas)
+            matrices_batch = torch.stack((torch.stack((c, -s, c*0), 0),
+                                        torch.stack((s, c, s*0), 0)), 0).permute(2, 0, 1)
+            grids_batch = F.affine_grid(matrices_batch, out_shape, align_corners=False)
+        if self.mode=="translation":
+            r1 = torch.cat((torch.zeros(N, device=device), torch.rand(N*self.n_samples, device=device) * 2 - 1)) * self.init_value
+            r2 = torch.cat((torch.zeros(N, device=device), torch.rand(N*self.n_samples, device=device) * 2 - 1)) * self.init_value
+            zero = r1 * 0.0
+            one = zero + 1.0
+            matrices_batch = torch.stack((torch.stack((one, zero, r1), 0),
+                                torch.stack((zero, one, r2), 0)), 0).permute(2, 0, 1)
+            grids_batch = F.affine_grid(matrices_batch, out_shape, align_corners=True)
+        if self.mode=="scaled":
+            s1 = torch.cat((torch.zeros(N, device=device), torch.rand(N*self.n_samples, device=device) * 2 - 1)) * self.init_value
+            zero = s1 * 0.0
+            one = zero + 1.0
+            matrices_batch = torch.stack((torch.stack((torch.exp(s1), zero, zero), 0),
+                                    torch.stack((zero, torch.exp(s1), zero), 0)), 0).permute(2, 0, 1)
+            grids_batch = F.affine_grid(matrices_batch, out_shape, align_corners=True)
+
+        out = F.grid_sample(x.unsqueeze(1).expand(N, self.n_samples+1, C, H, W).contiguous().view(N*(self.n_samples+1), C, H, W), grids_batch, align_corners=align_corners, mode=mode)
+        out = out.view(N, self.n_samples+1, C, H, W)
+
+        return out
