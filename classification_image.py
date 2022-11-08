@@ -54,7 +54,7 @@ flags.DEFINE_bool('optimize_aug', False, 'Whether to differentiably optimize aug
 flags.DEFINE_bool('softplus', False, 'Whether to use softplus on the rot factor parameters')
 flags.DEFINE_float('init_aug', 0.0, 'Initial value for the transformation parameters (before softplus if its used)')
 flags.DEFINE_bool('save', True, 'Whether to save the experiment outcome as pickle')
-flags.DEFINE_enum('device', 'cuda', ['cpu', 'cuda'], 'Torch device')
+flags.DEFINE_enum('device', 'cuda', ['cpu', 'cuda', 'cuda:1'], 'Torch device')
 flags.DEFINE_bool('download', True, 'whether to (re-)download data set')
 flags.DEFINE_string('data_root', 'tmp', 'root of the data directory')
 
