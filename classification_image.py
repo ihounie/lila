@@ -15,9 +15,9 @@ from lila.datasets import RotatedMNIST, TranslatedMNIST, ScaledMNIST
 from lila.datasets import RotatedFashionMNIST, TranslatedFashionMNIST, ScaledFashionMNIST
 from lila.datasets import RotatedCIFAR10, TranslatedCIFAR10, ScaledCIFAR10
 from lila.utils import TensorDataLoader, dataset_to_tensors, get_laplace_approximation, set_seed
-from lila.layers import AffineLayer2d, Constrained_Affine
+from lila.layers import AffineLayer2d, Constrained_Affine, Constrained_Affine_All, Identity
 from lila.augerino import augerino
-from lila.constrained import primal_dual
+from lila.constrained import primal_dual, primal_dual_all
 from lila.uniform import uniform_aug
 from lila.models import MLP, LeNet, ResNet, WideResNet
 
@@ -78,6 +78,7 @@ flags.DEFINE_integer('n_hypersteps_prior', 1, 'hyper steps for prior')
 flags.DEFINE_float('lr_dual', 1e-2, 'dual learning rate')
 flags.DEFINE_float('epsilon', 0.1, 'constraint_level')
 flags.DEFINE_bool('keep_all', False, 'whether to keep all samples in the chain')
+flags.DEFINE_bool('all_transforms', True, 'Constrain all Transforms')
 ##############
 #   LOGGING
 ##############
@@ -155,7 +156,10 @@ def main(argv):
     X_train, y_train = dataset_to_tensors(train_dataset, subset_indices, FLAGS.device)
     X_test, y_test = dataset_to_tensors(test_dataset, None, FLAGS.device)
     if FLAGS.method in ["constrained", "uniform_aug"]:
-        augmenter = Constrained_Affine(FLAGS.dataset, n_samples=FLAGS.n_samples_aug).to(FLAGS.device)
+        if FLAGS.all_transforms: 
+            augmenter = Constrained_Affine_All(FLAGS.dataset, n_samples=FLAGS.n_samples_aug).to(FLAGS.device)
+        else:
+            augmenter = Constrained_Affine(FLAGS.dataset, n_samples=FLAGS.n_samples_aug).to(FLAGS.device)
     else:
         augmenter = AffineLayer2d(n_samples=FLAGS.n_samples_aug, init_value=FLAGS.init_aug,
                               softplus=FLAGS.softplus).to(FLAGS.device)
@@ -165,9 +169,12 @@ def main(argv):
         batch_size = subset_size
     else:
         batch_size = min(FLAGS.batch_size, subset_size)
-
-    train_loader = TensorDataLoader(X_train, y_train, transform=augmenter, batch_size=batch_size, shuffle=True, detach=True)
-    valid_loader = TensorDataLoader(X_test, y_test, transform=augmenter, batch_size=batch_size, detach=True)
+    if FLAGS.method=="constrained" and FLAGS.all_transforms:
+        train_loader = TensorDataLoader(X_train, y_train, transform=Identity(), batch_size=batch_size, shuffle=True, detach=True)
+        valid_loader = TensorDataLoader(X_test, y_test, transform=Identity(expand=True), batch_size=batch_size, detach=True)
+    else:
+        train_loader = TensorDataLoader(X_train, y_train, transform=augmenter, batch_size=batch_size, shuffle=True, detach=True)
+        valid_loader = TensorDataLoader(X_test, y_test, transform=augmenter, batch_size=batch_size, detach=True)
     if FLAGS.marglik_batch_size == batch_size or FLAGS.marglik_batch_size <= 0:
         marglik_loader = deepcopy(train_loader).attach()
     else:
@@ -259,11 +266,18 @@ def main(argv):
 
     elif FLAGS.method == 'constrained':
         train_loader.attach()
-        model, losses, valid_perfs, train_perfs, dual = primal_dual(
-            model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
-            augmenter=augmenter, epsilon=FLAGS.epsilon, lr_dual=FLAGS.lr_dual,
-            lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
-        )
+        if FLAGS.all_transforms:
+            model, losses, valid_perfs, train_perfs, dual = primal_dual_all(
+                model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
+                augmenter=augmenter, epsilon=FLAGS.epsilon, lr_dual=FLAGS.lr_dual,
+                lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
+            )
+        else:
+            model, losses, valid_perfs, train_perfs, dual = primal_dual(
+                model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
+                augmenter=augmenter, epsilon=FLAGS.epsilon, lr_dual=FLAGS.lr_dual,
+                lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
+            )
         result['losses'] = losses
     elif FLAGS.method == 'uniform_aug':
         train_loader.attach()
@@ -279,7 +293,10 @@ def main(argv):
 
     if FLAGS.wandb_log:
         name = f'{FLAGS.dataset}_{FLAGS.method}_N={FLAGS.subset_size}_seed={FLAGS.seed}'
-        wandb.init(project=FLAGS.project, entity="hounie", name=name)
+        project = FLAGS.project
+        if FLAGS.all_transforms:
+            project = "ALL_"+project
+        wandb.init(project=project, entity="hounie", name=name)
         config = {"dataset": FLAGS.dataset, "model":FLAGS.model,
                  "num_samples": FLAGS.subset_size,"seed":FLAGS.seed,
                  "method": FLAGS.method,"lr_dual":FLAGS.lr_dual, "epsilon":FLAGS.epsilon,
@@ -287,7 +304,10 @@ def main(argv):
         wandb.config.update(config)
         wandb.log({"test_acc":valid_perfs[-1] , "train_acc": train_perfs[-1], "train_loss": losses[-1]})
         if FLAGS.method == 'constrained':
-            wandb.log({"dual":dual})
+            if FLAGS.all_transforms:
+                wandb.log({"dual_rotation":dual[0].item(), "dual_translation":dual[1].item(), "dual_scale":dual[2].item()})
+            else:
+                wandb.log({"dual":dual})
         weights_path = os.path.join('weights', str(wandb.run.id)+'.pt')
         torch.save(model.state_dict(), weights_path)
         wandb.save(weights_path, policy = 'now')

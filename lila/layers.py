@@ -267,7 +267,160 @@ class Constrained_Affine(torch.nn.Module):
                                     torch.stack((zero, torch.exp(s1), zero), 0)), 0).permute(2, 0, 1)
             grids_batch = F.affine_grid(matrices_batch, out_shape, align_corners=True)
 
-        out = F.grid_sample(x.unsqueeze(1).expand(N, self.n_samples+1, C, H, W).contiguous().view(N*(self.n_samples+1), C, H, W), grids_batch, align_corners=align_corners, mode=mode)
-        out = out.view(N, self.n_samples+1, C, H, W)
+        if self.mode== "identity":
+            return x.unsqueeze(1)
+        else:
+            out = F.grid_sample(x.unsqueeze(1).expand(N, self.n_samples+1, C, H, W).contiguous().view(N*(self.n_samples+1), C, H, W), grids_batch, align_corners=align_corners, mode=mode)
+            out = out.view(N, self.n_samples+1, C, H, W)
+            return out
 
+class _Constrained_Affine_All(torch.nn.Module):
+    """ Layer that creates affine transformed versions of 2d image inputs sampled between U(-parameter, +parameter),
+        with single scalar parameter.
+
+        Args:
+            rot_factor: Initial rotation factor (0 = no invariance, 1 = full circle ±180 degrees)
+            deterministic: If true, we replace the stochastic reparameterization trick by scaling fixed linspaced samples
+            n_samples: Amount of samples to use.
+            independent: Independently sample datapoints within batch (otherwise the n_samples samples are joinedly sampled within the batch for speed-up)
+
+     """
+    def __init__(self, dataset, n_samples=16):
+        super().__init__()
+        self.n_samples = n_samples
+        init_values = {}
+        init_values["rotation"] = pi
+        init_values["translation"] = 1
+        init_values["scale"] = 1
+        self.init_values = init_values
+        self.n_transforms = 3
+
+    def forward(self, x, align_corners=False, mode='bilinear'):
+        """Connects to the next available port.
+
+        Args:
+            x: Input tensor with dimensions (B, C, H, W)
+            align_corners: Uses align_corners convention.
+            mode: Type of interpolation. (nearest|bilinear)
+
+        Returns:
+            Rotated input 'n_samples' times with rotations uniformly sampled between -rot_factor*pi and +rot_factor*pi rads.
+            Output dimension: (B, n_samples, C, H, W)
+
+        """
+
+        # Obtain sample values
+        device = x.device
+
+        # Build resampling grids
+        N, C, H, W = x.shape
+        # Evaluate corresponding vector field on pixel locations
+        out_shape = (N * (self.n_samples), C, H, W)
+        thetas = (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["rotation"]
+        c, s = torch.cos(thetas), torch.sin(thetas)
+        matrices_rotation = torch.stack((torch.stack((c, -s, c*0), 0),
+                                    torch.stack((s, c, s*0), 0)), 0).permute(2, 0, 1)
+        grids_rotation = F.affine_grid(matrices_rotation, out_shape, align_corners=False)
+
+        r1 =  (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["translation"]
+        r2 = (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["translation"]
+        zero = r1 * 0.0
+        one = zero + 1.0
+        matrices_translation = torch.stack((torch.stack((one, zero, r1), 0),
+                            torch.stack((zero, one, r2), 0)), 0).permute(2, 0, 1)
+        grids_translation = F.affine_grid(matrices_translation, out_shape, align_corners=True)
+        s1 = (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["scale"]
+        zero = s1 * 0.0
+        one = zero + 1.0
+        matrices_scale= torch.stack((torch.stack((torch.exp(s1), zero, zero), 0),
+                                torch.stack((zero, torch.exp(s1), zero), 0)), 0).permute(2, 0, 1)
+        grids_scale = F.affine_grid(matrices_scale, out_shape, align_corners=True)
+        grids_batch = torch.cat((grids_rotation, grids_translation, grids_scale))
+        out = F.grid_sample(x.unsqueeze(1).expand(N, 3*self.n_samples, C, H, W).contiguous().view(N*(3*self.n_samples), C, H, W), grids_batch, align_corners=align_corners, mode=mode)
+        out = out.view(N, 3*self.n_samples, C, H, W)
+        out = torch.cat((x.unsqueeze(1),out), dim=1)
         return out
+
+class Constrained_Affine_All(torch.nn.Module):
+    """ Layer that creates affine transformed versions of 2d image inputs sampled between U(-parameter, +parameter),
+        with single scalar parameter.
+
+        Args:
+            rot_factor: Initial rotation factor (0 = no invariance, 1 = full circle ±180 degrees)
+            deterministic: If true, we replace the stochastic reparameterization trick by scaling fixed linspaced samples
+            n_samples: Amount of samples to use.
+            independent: Independently sample datapoints within batch (otherwise the n_samples samples are joinedly sampled within the batch for speed-up)
+
+     """
+    def __init__(self, dataset, n_samples=16):
+        super().__init__()
+        self.n_samples = n_samples
+        init_values = {}
+        init_values["rotation"] = pi
+        init_values["translation"] = 0.5
+        init_values["scale"] = 1.5
+        self.init_values = init_values
+        self.n_transforms = 3
+        self.mode="identity"
+
+    def forward(self, x, align_corners=False, mode='bilinear'):
+        """Connects to the next available port.
+
+        Args:
+            x: Input tensor with dimensions (B, C, H, W)
+            align_corners: Uses align_corners convention.
+            mode: Type of interpolation. (nearest|bilinear)
+
+        Returns:
+            Rotated input 'n_samples' times with rotations uniformly sampled between -rot_factor*pi and +rot_factor*pi rads.
+            Output dimension: (B, n_samples, C, H, W)
+
+        """
+
+        # Obtain sample values
+        device = x.device
+
+        # Build resampling grids
+        N, C, H, W = x.shape
+        # Evaluate corresponding vector field on pixel locations
+        out_shape = (N * (self.n_samples), C, H, W)
+
+        if self.mode=="rotation":
+            thetas = (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["rotation"]
+            c, s = torch.cos(thetas), torch.sin(thetas)
+            matrices_batch = torch.stack((torch.stack((c, -s, c*0), 0),
+                                        torch.stack((s, c, s*0), 0)), 0).permute(2, 0, 1)
+            grids_batch = F.affine_grid(matrices_batch, out_shape, align_corners=False)
+        if self.mode=="translation":
+            r1 = (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["translation"]
+            r2 = (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["translation"]
+            zero = r1 * 0.0
+            one = zero + 1.0
+            matrices_batch = torch.stack((torch.stack((one, zero, r1), 0),
+                                torch.stack((zero, one, r2), 0)), 0).permute(2, 0, 1)
+            grids_batch = F.affine_grid(matrices_batch, out_shape, align_corners=True)
+        if self.mode=="scale":
+            s1 = (torch.rand(N*self.n_samples, device=device) * 2 - 1) * self.init_values["scale"]
+            zero = s1 * 0.0
+            one = zero + 1.0
+            matrices_batch = torch.stack((torch.stack((torch.exp(s1), zero, zero), 0),
+                                    torch.stack((zero, torch.exp(s1), zero), 0)), 0).permute(2, 0, 1)
+            grids_batch = F.affine_grid(matrices_batch, out_shape, align_corners=True)
+
+        if self.mode=="identity":
+            return x.unsqueeze(1)
+        else:
+            out = F.grid_sample(x.unsqueeze(1).expand(N, self.n_samples, C, H, W).contiguous().view(N*(self.n_samples), C, H, W), grids_batch, align_corners=align_corners, mode=mode)
+            out = out.view(N, self.n_samples, C, H, W)
+            return out
+
+class Identity(torch.nn.Module):
+    def __init__(self, expand=False):
+        super().__init__()
+        self.expand=expand
+
+    def forward(self, x):
+        if self.expand:
+            return x.unsqueeze(1)
+        else:
+            return x  
