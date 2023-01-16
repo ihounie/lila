@@ -11,6 +11,23 @@ from torchvision.datasets import MNIST, FashionMNIST, CIFAR10
 
 from laplace import FullLaplace, KronLaplace, DiagLaplace
 
+class Huber_loss:
+    def __init__(self, delta=0.5, a=1.0):
+        self.delta=delta
+        self.a = a
+    def eval(self, u):
+        return self.a*0.5*(torch.abs(u)<= self.delta)*u**2 + self.a*self.delta*(u>self.delta)(torch.abs(u)-0.5*self.delta)
+
+    def grad(self, u):
+        return self.a*(torch.abs(u)<=self.delta) * u + self.a*self.delta * (u>self.delta)
+
+class Quad_cost:
+    def __init__(self, a=1.0):
+        self.a = a
+    def eval(self, u):
+        return self.a*0.5*(u**2)
+    def grad(self, u):
+        return self.a * u
 
 def setup_center_grid(radius, resolution):
     """Sets up a grid [-radius, radius] x [-radius, radius] 

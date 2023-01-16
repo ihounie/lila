@@ -1,5 +1,5 @@
 #!/bin/bash
-for seed in 1 1 3
+for seed in 1 2 3
 do
     for model in "mlp" "cnn"
         do

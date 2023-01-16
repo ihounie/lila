@@ -14,12 +14,15 @@ from lila.marglik import marglik_opt_jvecprod, marglik_optimization
 from lila.datasets import RotatedMNIST, TranslatedMNIST, ScaledMNIST 
 from lila.datasets import RotatedFashionMNIST, TranslatedFashionMNIST, ScaledFashionMNIST
 from lila.datasets import RotatedCIFAR10, TranslatedCIFAR10, ScaledCIFAR10
-from lila.utils import TensorDataLoader, dataset_to_tensors, get_laplace_approximation, set_seed
+from lila.utils import TensorDataLoader, dataset_to_tensors, get_laplace_approximation, set_seed, Huber_loss
 from lila.layers import AffineLayer2d, Constrained_Affine, Constrained_Affine_All, Identity
 from lila.augerino import augerino
 from lila.constrained import primal_dual, primal_dual_all
+from lila.resilient import resilient_all
+from lila.unconstrained import erm
 from lila.uniform import uniform_aug
 from lila.models import MLP, LeNet, ResNet, WideResNet
+from lila.utils import Huber_loss, Quad_cost
 
 import wandb
 
@@ -28,7 +31,7 @@ np.set_printoptions(precision=3)
 
 flags.DEFINE_integer('seed', 137, 'Random seed for data generation and model initialization.')
 flags.DEFINE_enum(
-    'method', 'avgfunc', ['avgfunc', 'augerino', 'constrained', 'uniform_aug'],
+    'method', 'avgfunc', ['baseline', 'avgfunc', 'augerino', 'constrained', 'uniform_aug', 'resilient'],
     'Available methods: `avgfunc` is averaging functions, `augerino` is by Benton et al.')
 flags.DEFINE_float('augerino_reg', 1e-2, 'Augerino regularization strength (default from paper).')
 flags.DEFINE_enum(
@@ -80,10 +83,17 @@ flags.DEFINE_float('epsilon', 0.1, 'constraint_level')
 flags.DEFINE_bool('keep_all', False, 'whether to keep all samples in the chain')
 flags.DEFINE_bool('all_transforms', True, 'Constrain all Transforms')
 ##############
+# Resilient
+##############
+flags.DEFINE_enum('penalization', 'huber', ['huber', 'quad'], help='perturbation penalisation func. (h)')
+flags.DEFINE_float('huber_delta', 0.2,"huber delta parameter")
+flags.DEFINE_float('huber_a',1.0,  "huber quadratic parameter")
+flags.DEFINE_float('lr_perturb', 1.0, "perturbation (u) learning rate")
+##############
 #   LOGGING
 ##############
 flags.DEFINE_bool('wandb_log', True, 'W&B logging')
-flags.DEFINE_string('project', 'Invariance', 'W&B project')
+flags.DEFINE_string('project', 'Inv_Resilience', 'W&B project')
 
 def main(argv):
     # dataset-specific static transforms (preprocessing)
@@ -155,7 +165,8 @@ def main(argv):
         subset_indices = None
     X_train, y_train = dataset_to_tensors(train_dataset, subset_indices, FLAGS.device)
     X_test, y_test = dataset_to_tensors(test_dataset, None, FLAGS.device)
-    if FLAGS.method in ["constrained", "uniform_aug"]:
+    augmenter = None
+    if FLAGS.method in ["constrained", "uniform_aug", "resilient"]:
         if FLAGS.all_transforms: 
             augmenter = Constrained_Affine_All(FLAGS.dataset, n_samples=FLAGS.n_samples_aug).to(FLAGS.device)
         else:
@@ -169,7 +180,7 @@ def main(argv):
         batch_size = subset_size
     else:
         batch_size = min(FLAGS.batch_size, subset_size)
-    if FLAGS.method=="constrained" and FLAGS.all_transforms:
+    if FLAGS.method=="constrained" or FLAGS.method=="resilient" and FLAGS.all_transforms:
         train_loader = TensorDataLoader(X_train, y_train, transform=Identity(), batch_size=batch_size, shuffle=True, detach=True)
         valid_loader = TensorDataLoader(X_test, y_test, transform=Identity(expand=True), batch_size=batch_size, detach=True)
     else:
@@ -218,7 +229,7 @@ def main(argv):
     model.to(FLAGS.device)
 
     result = dict()
-    if FLAGS.method not in ['augerino', 'constrained', 'uniform_aug']:  # LA marglik methods
+    if FLAGS.method not in ['augerino', 'constrained', 'uniform_aug', 'resilient', 'baseline']:  # LA marglik methods
         # Resolve backend and LA type
         hess_approx, la_structure = FLAGS.approx.split('_')
         laplace = get_laplace_approximation(la_structure)
@@ -271,13 +282,38 @@ def main(argv):
                 model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
                 augmenter=augmenter, epsilon=FLAGS.epsilon, lr_dual=FLAGS.lr_dual,
                 lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
-            )
+            ) 
         else:
             model, losses, valid_perfs, train_perfs, dual = primal_dual(
                 model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
                 augmenter=augmenter, epsilon=FLAGS.epsilon, lr_dual=FLAGS.lr_dual,
                 lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
             )
+        result['losses'] = losses
+    elif FLAGS.method == 'resilient':
+        train_loader.attach()
+        if FLAGS.penalization == "huber":
+            h = Huber_loss(delta=FLAGS.huber_delta, a=FLAGS.huber_a)
+        elif FLAGS.penalization == "quad":
+            h = Quad_cost(a=FLAGS.huber_a)
+        else:
+            raise NotImplementedError
+        if FLAGS.all_transforms:
+            model, losses, valid_perfs, train_perfs, dual, u = resilient_all(
+                model, train_loader, valid_loader, h = h, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
+                augmenter=augmenter, epsilon=FLAGS.epsilon, lr_dual=FLAGS.lr_dual, lr_perturb=FLAGS.lr_perturb,
+                lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
+            ) 
+        else:
+            raise NotImplementedError
+        result['losses'] = losses
+    elif FLAGS.method == 'baseline':
+        train_loader.attach()
+        model, losses, valid_perfs, train_perfs = erm(
+            model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
+            augmenter=augmenter, 
+            lr_min=FLAGS.lr_min, keep_all=FLAGS.keep_all, scheduler='cos', optimizer=optimizer
+        ) 
         result['losses'] = losses
     elif FLAGS.method == 'uniform_aug':
         train_loader.attach()
@@ -301,13 +337,24 @@ def main(argv):
                  "num_samples": FLAGS.subset_size,"seed":FLAGS.seed,
                  "method": FLAGS.method,"lr_dual":FLAGS.lr_dual, "epsilon":FLAGS.epsilon,
                  "MH_keep":FLAGS.keep_all, "epochs":FLAGS.n_epochs, "n_samples_aug":FLAGS.n_samples_aug} 
+        if FLAGS.method == "resilient":
+            config["quad_coeff"] = FLAGS.huber_a
+            if FLAGS.penalization == "huber":
+                config["huber_delta"] = FLAGS.huber_delta
+            config["penalization"] =  FLAGS.penalization
+
         wandb.config.update(config)
         wandb.log({"test_acc":valid_perfs[-1] , "train_acc": train_perfs[-1], "train_loss": losses[-1]})
-        if FLAGS.method == 'constrained':
+        if FLAGS.method in ['constrained', 'resilient']:
             if FLAGS.all_transforms:
                 wandb.log({"dual_rotation":dual[0].item(), "dual_translation":dual[1].item(), "dual_scale":dual[2].item()})
             else:
                 wandb.log({"dual":dual})
+        if FLAGS.method in 'resilient':
+            if FLAGS.all_transforms:
+                wandb.log({"u_rotation":u[0].item(), "u_translation":u[1].item(), "u_scale":u[2].item()})
+            else:
+                wandb.log({"perturbation":u})
         weights_path = os.path.join('weights', str(wandb.run.id)+'.pt')
         torch.save(model.state_dict(), weights_path)
         wandb.save(weights_path, policy = 'now')
