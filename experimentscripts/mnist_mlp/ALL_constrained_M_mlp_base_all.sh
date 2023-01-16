@@ -1,7 +1,7 @@
 #!/bin/bash
 EPS=0.35
 LRDUAL=0.0005
-EPOCHS=400
+EPOCHS=1000
 for seed in 1 2 3
 do
     for model in "cnn"

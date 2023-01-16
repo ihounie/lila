@@ -1,5 +1,5 @@
 #!/bin/bash
-EPOCHS=400
+EPOCHS=1000
 for seed in 2 3
 do
     for model in "mlp"

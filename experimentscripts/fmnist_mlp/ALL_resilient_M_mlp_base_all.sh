@@ -1,6 +1,6 @@
 #!/bin/bash
 LRDUAL=0.0005
-EPOCHS=400
+EPOCHS=1000
 DEVICE="cuda:1"
 for huber_a in 1.0 2.0 0.5 0.25 4.0
 do

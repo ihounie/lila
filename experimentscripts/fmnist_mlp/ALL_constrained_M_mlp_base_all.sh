@@ -1,6 +1,6 @@
 #!/bin/bash
 LRDUAL=0.0005
-EPOCHS=400
+EPOCHS=1000
 DEVICE="cuda:1"
 for seed in 1 2 3
 do  
