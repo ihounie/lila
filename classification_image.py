@@ -266,7 +266,7 @@ def main(argv):
 
     elif FLAGS.method == 'augerino':
         train_loader.attach()
-        model, losses, valid_perfs, aug_history = augerino(
+        model, losses, valid_perfs, train_perfs, aug_history = augerino(
             model, train_loader, valid_loader, n_epochs=FLAGS.n_epochs, lr=FLAGS.lr,
             augmenter=augmenter, aug_reg=FLAGS.augerino_reg, lr_aug=FLAGS.lr_augerino,
             lr_min=FLAGS.lr_min, scheduler='cos', optimizer=optimizer

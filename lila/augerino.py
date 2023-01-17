@@ -90,5 +90,5 @@ def augerino(model,
                 logging.info(f'AUGERINO[epoch={epoch}]: validation performance {valid_perf*100:.2f}.%')
 
     if optimize_aug:
-        return model, losses, valid_perfs, aug_history
+        return model, losses, valid_perfs,[epoch_perf], aug_history
     return model, losses, valid_perfs, None
