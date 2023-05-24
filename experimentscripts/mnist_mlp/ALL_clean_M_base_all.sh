@@ -1,5 +1,5 @@
 #!/bin/bash
-EPS=0.35
+EPS=0.1
 LRDUAL=0.0005
 EPOCHS=1000
 huber_a=1.0

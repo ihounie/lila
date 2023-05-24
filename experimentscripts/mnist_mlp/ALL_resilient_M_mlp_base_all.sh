@@ -1,8 +1,8 @@
 #!/bin/bash
-EPS=0.25
+EPS=0.1
 LRDUAL=0.0005
 EPOCHS=1000
-for huber_a in 1.0 2.0 0.5 0.25 4.0
+for huber_a in 0.5
 do
     for seed in 0 1 2:
     do
